@@ -1,0 +1,93 @@
+name: Rollback GitHub Pages Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to roll back to (e.g. deploy/2026-02-13-1430 or v4.5.0). Leave empty to see recent tags.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  list-tags:
+    if: inputs.tag == ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: List recent deployment tags
+        run: |
+          echo "### Available deployment snapshots" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "No tag specified. Here are the 15 most recent deployment snapshots:" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          git tag -l 'deploy/*' --sort=-version:refname | head -15 >> "$GITHUB_STEP_SUMMARY"
+          git tag -l 'v*' --sort=-version:refname | head -5 >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Re-run this workflow with a tag from the list above." >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::No tag specified. Check the workflow summary for available tags."
+          exit 1
+
+  rollback:
+    if: inputs.tag != ''
+    environment:
+      name: github-pages
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+
+      - name: Verify tag exists
+        run: |
+          echo "Rolling back to: ${{ inputs.tag }}"
+          echo "Commit: $(git rev-parse HEAD)"
+          echo "Date: $(git log -1 --pretty=%ci)"
+          echo "Message: $(git log -1 --pretty=%s)"
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Prepare site
+        run: |
+          mkdir -p _site/tools/ontology-visualiser
+          mkdir -p _site/PBS/TOOLS/ontology-visualiser
+          mkdir -p _site/PBS/ONTOLOGIES/ontology-library
+          mkdir -p _site/PBS/ONTOLOGIES/pfc-foundation-ont/oaa-system-prompts
+          mkdir -p _site/PBS/AGENTS/oaa-v6
+
+          cp -r PBS/TOOLS/ontology-visualiser/* _site/PBS/TOOLS/ontology-visualiser/
+          cp -r PBS/TOOLS/ontology-visualiser/* _site/tools/ontology-visualiser/
+          echo '<!DOCTYPE html><html><head><meta http-equiv="refresh" content="0;url=PBS/TOOLS/ontology-visualiser/browser-viewer.html"><title>OAA Visualiser</title></head><body><a href="PBS/TOOLS/ontology-visualiser/browser-viewer.html">Go to OAA Ontology Visualiser</a></body></html>' > _site/index.html
+
+          cp -r PBS/ONTOLOGIES/ontology-library/* _site/PBS/ONTOLOGIES/ontology-library/
+          cp -r PBS/ONTOLOGIES/pfc-foundation-ont/oaa-system-prompts/* _site/PBS/ONTOLOGIES/pfc-foundation-ont/oaa-system-prompts/
+          cp PBS/AGENTS/oaa-v6/system-prompt.md _site/PBS/AGENTS/oaa-v6/
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Rollback summary
+        run: |
+          echo "### ⏪ Rollback complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Restored to:** \`${{ inputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Commit:** \`$(git rev-parse --short HEAD)\` — $(git log -1 --pretty=%s)" >> "$GITHUB_STEP_SUMMARY"
+          echo "**URL:** ${{ steps.deployment.outputs.page_url }}" >> "$GITHUB_STEP_SUMMARY"

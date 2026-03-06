@@ -1,0 +1,414 @@
+name: PFC-Core Release
+
+# Releases filtered ontology registry snapshots, sealed skills, and graph-scope
+# configs to PFI instance dev repos. Each PFI receives only the ontology series
+# it subscribes to. Sealed skills are distributed to all PFIs (not filtered).
+# Graph-scope configs define visible/ghost/hidden ontology classifications per PFI.
+# Targets are driven by pfiInstances in ont-registry-index.json.
+
+on:
+  push:
+    tags:
+      - 'pfc-v*'
+  workflow_dispatch:
+    inputs:
+      target_pfis:
+        description: 'Comma-separated PFI IDs (e.g. "PFI-BAIV,PFI-AIRL-CAF-AZA") or empty for all'
+        required: false
+        type: string
+        default: ''
+      components:
+        description: 'Components to release'
+        required: false
+        type: choice
+        options:
+          - ontology-registry
+          - sealed-skills
+          - all
+        default: all
+      dry_run:
+        description: 'Dry run — log what would happen without creating PRs'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pfc-release
+  cancel-in-progress: false
+
+jobs:
+  # ── Job 1: Build target matrix from ont-registry-index.json ──
+  load-targets:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+      release_tag: ${{ steps.tag.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="manual-$(date -u +%Y%m%d-%H%M%S)"
+          fi
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+
+      - name: Build PFI target matrix
+        id: build-matrix
+        env:
+          TARGET_PFIS: ${{ inputs.target_pfis }}
+        run: |
+          REGISTRY="PBS/ONTOLOGIES/ontology-library/ont-registry-index.json"
+
+          # Extract PFIs that have hubSpokeConfig with a dev repo
+          MATRIX=$(jq -c '
+            [.pfiInstances[]
+              | select(.hubSpokeConfig != null)
+              | select(.hubSpokeConfig.repos.dev != null)
+              | {
+                  pfiId: .["@id"],
+                  devRepo: .hubSpokeConfig.repos.dev,
+                  pfcPin: (.hubSpokeConfig.pfcPin // "latest"),
+                  ontologySeries: (.hubSpokeConfig.ontologySeries // []),
+                  license: (.hubSpokeConfig.license // "pfc-enterprise")
+                }
+            ]' "$REGISTRY")
+
+          # Filter by target_pfis input if provided
+          if [[ -n "$TARGET_PFIS" ]]; then
+            # Convert comma-separated to JSON array
+            FILTER=$(echo "$TARGET_PFIS" | jq -R 'split(",") | map(gsub("^\\s+|\\s+$"; ""))')
+            MATRIX=$(echo "$MATRIX" | jq -c --argjson filter "$FILTER" '
+              map(select(.pfiId as $id | $filter | any(. == $id)))
+            ')
+          fi
+
+          # Validate we have targets
+          COUNT=$(echo "$MATRIX" | jq 'length')
+          if [[ "$COUNT" -eq 0 ]]; then
+            echo "::error::No PFI targets found. Check target_pfis input or ont-registry-index.json pfiInstances."
+            exit 1
+          fi
+
+          echo "Found $COUNT PFI targets:"
+          echo "$MATRIX" | jq -r '.[] | "  - \(.pfiId) → \(.devRepo) (series: \(.ontologySeries | join(", ")))"'
+
+          # Output as matrix for GitHub Actions
+          echo "matrix={\"include\":$(echo "$MATRIX" | jq -c '.')}" >> "$GITHUB_OUTPUT"
+
+  # ── Job 2: Release to each PFI (parallel matrix) ──
+  release:
+    needs: load-targets
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJson(needs.load-targets.outputs.matrix) }}
+      fail-fast: false
+    env:
+      DRY_RUN: ${{ inputs.dry_run || 'false' }}
+      RELEASE_TAG: ${{ needs.load-targets.outputs.release_tag }}
+    steps:
+      - name: Release summary
+        run: |
+          echo "### PFC-Core Release" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Target:** ${{ matrix.pfiId }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Repo:** ${{ matrix.devRepo }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Tag:** $RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Series:** ${{ join(matrix.ontologySeries, ', ') }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Dry run:** $DRY_RUN" >> "$GITHUB_STEP_SUMMARY"
+
+      # Checkout source (Azlan-EA-AAA) for registry
+      - name: Checkout source (Azlan-EA-AAA)
+        uses: actions/checkout@v4
+        with:
+          path: source
+
+      # Checkout target PFI dev repo
+      - name: Checkout target (${{ matrix.devRepo }})
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.devRepo }}
+          token: ${{ secrets.PROMOTION_PAT }}
+          path: target
+
+      # Pin check — skip if PFI is pinned to a specific version that doesn't match
+      # pfcPin comes from hubSpokeConfig in ont-registry-index.json ("latest" or "pfc-vN.N.N")
+      # pfc-version file records what was last deployed (informational only)
+      - name: Check version pin
+        id: pin-check
+        run: |
+          PFC_PIN="${{ matrix.pfcPin }}"
+          echo "PFI pin (from registry): $PFC_PIN"
+
+          if [[ -f "target/pfc-core/pfc-version" ]]; then
+            echo "Last deployed: $(cat target/pfc-core/pfc-version)"
+          else
+            echo "No pfc-version file — first release to this PFI"
+          fi
+
+          if [[ "$PFC_PIN" != "latest" && "$PFC_PIN" != "$RELEASE_TAG" ]]; then
+            echo "::warning::${{ matrix.pfiId }} is pinned to $PFC_PIN — skipping (release is $RELEASE_TAG)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "- **Skipped:** Pinned to \`$PFC_PIN\`" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      # Filter registry by PFI's subscribed ontology series
+      - name: Filter ontology registry
+        if: steps.pin-check.outputs.skip != 'true'
+        run: |
+          REGISTRY="source/PBS/ONTOLOGIES/ontology-library/ont-registry-index.json"
+          SERIES_JSON='${{ toJson(matrix.ontologySeries) }}'
+
+          echo "Filtering registry for ${{ matrix.pfiId }}..."
+          echo "Subscribed series: $SERIES_JSON"
+
+          jq --argjson series "$SERIES_JSON" \
+             --arg releaseTag "$RELEASE_TAG" \
+             --arg targetPfi "${{ matrix.pfiId }}" \
+             --arg releaseDate "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+          '
+            # Build path prefixes from series names (e.g., "VE-Series" → "./VE-Series/")
+            ($series | map("./" + . + "/")) as $prefixes |
+
+            # Filter entries: match series prefix, exclude deprecated and orphans
+            .entries as $allEntries |
+            [
+              $allEntries[]
+              | select(
+                  (.status != "deprecated") and
+                  (.path | startswith("./_orphans") | not) and
+                  (. as $e | $prefixes | any(. as $p | $e.path | startswith($p)))
+                )
+            ] as $filteredEntries |
+
+            # Collect namespaces used by filtered entries
+            ([$filteredEntries[].namespace | rtrimstr(":")] | unique) as $usedNs |
+
+            # Filter namespace registry
+            (.namespaceRegistry | to_entries
+              | map(select(.key as $k | ($usedNs | any(. == $k)) or $k == "pf"))
+              | from_entries
+            ) as $filteredNs |
+
+            # Filter series registry to subscribed series only
+            (.seriesRegistry | to_entries
+              | map(select(.key as $k | $series | any(. == $k)))
+              | from_entries
+            ) as $filteredSeries |
+
+            # Recalculate statistics
+            {
+              totalOntologies: ($filteredEntries | length),
+              compliant: ([$filteredEntries[] | select(.status == "compliant")] | length),
+              superseded: ([$filteredEntries[] | select(.status == "superseded")] | length),
+              placeholder: ([$filteredEntries[] | select(.status == "placeholder")] | length),
+              deprecated: 0
+            } as $stats |
+
+            # Build output registry
+            {
+              "@context": .["@context"],
+              "@type": "OntologyRegistrySnapshot",
+              "@id": ("pfc-snapshot-" + $targetPfi),
+              name: (.name + " — " + $targetPfi + " Snapshot"),
+              sourceVersion: .version,
+              oaaVersion: .oaaVersion,
+              releaseTag: $releaseTag,
+              releaseDate: $releaseDate,
+              targetPfi: $targetPfi,
+              snapshotDescription: ("Filtered ontology registry for " + $targetPfi + ". Contains " + ($filteredEntries | length | tostring) + " ontologies from series: " + ($series | join(", ")) + "."),
+              entries: $filteredEntries,
+              namespaceRegistry: $filteredNs,
+              seriesRegistry: $filteredSeries,
+              statistics: $stats
+            }
+          ' "$REGISTRY" > /tmp/filtered-registry.json
+
+          # Report
+          TOTAL=$(jq '.statistics.totalOntologies' /tmp/filtered-registry.json)
+          echo "Filtered registry: $TOTAL ontologies for ${{ matrix.pfiId }}"
+          echo "- **Ontologies:** $TOTAL" >> "$GITHUB_STEP_SUMMARY"
+
+          jq -r '.entries[] | "  [\(.status)] \(.name) → \(.path)"' /tmp/filtered-registry.json
+
+      # Write artifacts to target repo
+      - name: Write artifacts
+        if: steps.pin-check.outputs.skip != 'true'
+        env:
+          COMPONENTS: ${{ inputs.components || 'all' }}
+        run: |
+          mkdir -p target/pfc-core
+
+          # ── Ontology registry snapshot ──
+          if [[ "$COMPONENTS" == "ontology-registry" || "$COMPONENTS" == "all" ]]; then
+            cp /tmp/filtered-registry.json target/pfc-core/ontology-registry.json
+            echo "Wrote ontology-registry.json"
+          fi
+
+          # Version file (always written)
+          echo "$RELEASE_TAG" > target/pfc-core/pfc-version
+
+          # ── Sealed skills ──
+          if [[ "$COMPONENTS" == "sealed-skills" || "$COMPONENTS" == "all" ]]; then
+            MANIFEST="source/azlan-github-workflow/sealed-skills-manifest.json"
+            if [[ -f "$MANIFEST" ]]; then
+              # Read sealed skills from manifest and copy each one
+              SKILL_COUNT=$(jq '.sealedSkills | length' "$MANIFEST")
+              echo "Distributing $SKILL_COUNT sealed skill(s)..."
+
+              for i in $(seq 0 $(( SKILL_COUNT - 1 ))); do
+                SRC=$(jq -r ".sealedSkills[$i].sourcePath" "$MANIFEST")
+                TGT=$(jq -r ".sealedSkills[$i].targetPath" "$MANIFEST")
+                NAME=$(jq -r ".sealedSkills[$i].name" "$MANIFEST")
+
+                if [[ -f "source/$SRC" ]]; then
+                  mkdir -p "target/$(dirname "$TGT")"
+                  cp "source/$SRC" "target/$TGT"
+                  echo "  ✅ Sealed skill: $NAME → $TGT"
+                else
+                  echo "  ⚠️ Skill source not found: $SRC"
+                fi
+              done
+
+              # Copy sealed plugin manifest so Claude Code discovers sealed skills
+              if [[ -d "source/pfc-core/.claude-plugin" ]]; then
+                mkdir -p target/pfc-core/.claude-plugin
+                cp source/pfc-core/.claude-plugin/plugin.json target/pfc-core/.claude-plugin/plugin.json
+                echo "  ✅ Sealed plugin manifest → pfc-core/.claude-plugin/plugin.json"
+              fi
+
+              # Copy sealed skills manifest for reference
+              cp "$MANIFEST" target/pfc-core/sealed-skills-manifest.json
+              echo "  ✅ Manifest → pfc-core/sealed-skills-manifest.json"
+            else
+              echo "⚠️ No sealed-skills-manifest.json found — skipping sealed skills"
+            fi
+
+            # ── Guard-core workflow ──
+            # Ensure the target repo has guard-core.yml to protect pfc-core/
+            if [[ -f "source/.github/workflows/guard-core.yml" ]]; then
+              mkdir -p target/.github/workflows
+              cp source/.github/workflows/guard-core.yml target/.github/workflows/guard-core.yml
+              echo "  ✅ guard-core.yml → .github/workflows/"
+            fi
+          fi
+
+          # ── Graph-scope config (F39.1) ──
+          # Distributes per-PFI graph-scope.json from pfi-graph-scopes/ to instance-data/config/
+          # The graph-scope defines visible/ghost/hidden ontology classifications per PFI
+          if [[ "$COMPONENTS" == "ontology-registry" || "$COMPONENTS" == "all" ]]; then
+            PFI_LOWER=$(echo "${{ matrix.pfiId }}" | tr '[:upper:]' '[:lower:]')
+            GRAPH_SCOPE="source/PBS/ONTOLOGIES/ontology-library/pfi-graph-scopes/${PFI_LOWER}-graph-scope.json"
+
+            if [[ -f "$GRAPH_SCOPE" ]]; then
+              mkdir -p target/instance-data/config
+              cp "$GRAPH_SCOPE" target/instance-data/config/graph-scope.json
+              echo "✅ Graph-scope config → instance-data/config/graph-scope.json"
+              echo "- **Graph scope:** $(jq '.metadata.visibleCount' "$GRAPH_SCOPE") visible, $(jq '.metadata.ghostCount' "$GRAPH_SCOPE") ghost, $(jq '.metadata.hiddenCount' "$GRAPH_SCOPE") hidden" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "⚠️ No graph-scope config found for ${{ matrix.pfiId }} at $GRAPH_SCOPE"
+            fi
+          fi
+
+      # Diff check — skip PR if nothing changed
+      - name: Check for changes
+        if: steps.pin-check.outputs.skip != 'true'
+        id: diff
+        working-directory: target
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes detected — ${{ matrix.pfiId }} already up to date"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "- **Result:** Already up to date" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Changes detected:"
+            git diff --cached --stat
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Create PR on target PFI dev repo
+      - name: Create release PR
+        if: steps.pin-check.outputs.skip != 'true' && steps.diff.outputs.changed == 'true' && env.DRY_RUN != 'true'
+        working-directory: target
+        env:
+          GH_TOKEN: ${{ secrets.PROMOTION_PAT }}
+        run: |
+          BRANCH="pfc-release/${RELEASE_TAG}/$(date -u +%Y%m%d-%H%M%S)"
+          TOTAL=$(jq '.statistics.totalOntologies' pfc-core/ontology-registry.json)
+          SERIES='${{ join(matrix.ontologySeries, ', ') }}'
+
+          git checkout -b "$BRANCH"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "$(cat <<EOF
+          PFC-Core release: $RELEASE_TAG
+
+          Filtered ontology registry snapshot for ${{ matrix.pfiId }}.
+          Contains $TOTAL ontologies from series: $SERIES.
+
+          Source: ajrmooreuk/Azlan-EA-AAA
+          Tag: $RELEASE_TAG
+          EOF
+          )"
+
+          git push origin "$BRANCH"
+
+          PR_BODY=$(cat <<'PREOF'
+          ## PFC-Core Release
+
+          | Field | Value |
+          |-------|-------|
+          PREOF
+          )
+          PR_BODY+=$'\n'"| Release Tag | \`$RELEASE_TAG\` |"
+          PR_BODY+=$'\n'"| Target PFI | ${{ matrix.pfiId }} |"
+          PR_BODY+=$'\n'"| Ontologies | $TOTAL |"
+          PR_BODY+=$'\n'"| Series | $SERIES |"
+          PR_BODY+=$'\n'
+          PR_BODY+=$'\n'"### What changed"
+          PR_BODY+=$'\n'"- \`pfc-core/ontology-registry.json\` — filtered registry snapshot"
+          PR_BODY+=$'\n'"- \`pfc-core/pfc-version\` — version pin updated to \`$RELEASE_TAG\`"
+          PR_BODY+=$'\n'"- \`pfc-core/skills/\` — sealed skills (executable, not editable)"
+          PR_BODY+=$'\n'"- \`pfc-core/.claude-plugin/plugin.json\` — sealed skills plugin manifest"
+          PR_BODY+=$'\n'"- \`instance-data/config/graph-scope.json\` — visible/ghost/hidden ontology classification"
+          PR_BODY+=$'\n'"- \`.github/workflows/guard-core.yml\` — CI gate protecting pfc-core/"
+          PR_BODY+=$'\n'
+          PR_BODY+=$'\n'"> This PR was created automatically by the PFC-Core release pipeline."
+          PR_BODY+=$'\n'"> Source: [Azlan-EA-AAA](https://github.com/ajrmooreuk/Azlan-EA-AAA)"
+          PR_BODY+=$'\n'"> **Do not edit pfc-core/ manually** — changes will be overwritten on next release."
+
+          PR_URL=$(gh pr create \
+            --repo "${{ matrix.devRepo }}" \
+            --title "PFC-Core release: $RELEASE_TAG" \
+            --body "$PR_BODY" \
+            --label "pfc-core-release" \
+            --head "$BRANCH" \
+            --base main)
+
+          echo "PR created: $PR_URL"
+          echo "- **PR:** [$PR_URL]($PR_URL)" >> "$GITHUB_STEP_SUMMARY"
+
+      # Dry run summary
+      - name: Dry run report
+        if: steps.pin-check.outputs.skip != 'true' && steps.diff.outputs.changed == 'true' && env.DRY_RUN == 'true'
+        run: |
+          echo "### DRY RUN — would create PR" >> "$GITHUB_STEP_SUMMARY"
+          TOTAL=$(jq '.statistics.totalOntologies' /tmp/filtered-registry.json)
+          echo "- **Ontologies:** $TOTAL" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Files:**" >> "$GITHUB_STEP_SUMMARY"
+          echo "  - pfc-core/ontology-registry.json" >> "$GITHUB_STEP_SUMMARY"
+          echo "  - pfc-core/pfc-version" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Filtered registry preview:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          jq '{targetPfi, releaseTag, statistics, entries: [.entries[] | {name, status, path}]}' /tmp/filtered-registry.json >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
