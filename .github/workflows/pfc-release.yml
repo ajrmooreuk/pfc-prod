@@ -65,7 +65,7 @@ jobs:
         env:
           TARGET_PFIS: ${{ inputs.target_pfis }}
         run: |
-          REGISTRY="PBS/ONTOLOGIES/ontology-library/ont-registry-index.json"
+          REGISTRY="ontology-library/ont-registry-index.json"
 
           # Extract PFIs that have hubSpokeConfig with a dev repo
           MATRIX=$(jq -c '
@@ -164,7 +164,7 @@ jobs:
       - name: Filter ontology registry
         if: steps.pin-check.outputs.skip != 'true'
         run: |
-          REGISTRY="source/PBS/ONTOLOGIES/ontology-library/ont-registry-index.json"
+          REGISTRY="source/ontology-library/ont-registry-index.json"
           SERIES_JSON='${{ toJson(matrix.ontologySeries) }}'
 
           echo "Filtering registry for ${{ matrix.pfiId }}..."
@@ -258,7 +258,7 @@ jobs:
 
           # ── Sealed skills ──
           if [[ "$COMPONENTS" == "sealed-skills" || "$COMPONENTS" == "all" ]]; then
-            MANIFEST="source/azlan-github-workflow/sealed-skills-manifest.json"
+            MANIFEST="source/sealed-skills/manifest.json"
             if [[ -f "$MANIFEST" ]]; then
               # Read sealed skills from manifest and copy each one
               SKILL_COUNT=$(jq '.sealedSkills | length' "$MANIFEST")
@@ -306,7 +306,7 @@ jobs:
           # The graph-scope defines visible/ghost/hidden ontology classifications per PFI
           if [[ "$COMPONENTS" == "ontology-registry" || "$COMPONENTS" == "all" ]]; then
             PFI_LOWER=$(echo "${{ matrix.pfiId }}" | tr '[:upper:]' '[:lower:]')
-            GRAPH_SCOPE="source/PBS/ONTOLOGIES/ontology-library/pfi-graph-scopes/${PFI_LOWER}-graph-scope.json"
+            GRAPH_SCOPE="source/ontology-library/pfi-graph-scopes/${PFI_LOWER}-graph-scope.json"
 
             if [[ -f "$GRAPH_SCOPE" ]]; then
               mkdir -p target/instance-data/config
